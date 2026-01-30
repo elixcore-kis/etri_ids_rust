@@ -309,6 +309,7 @@ pub struct EVELogParser {
     sub_label_map: HashMap<u32, u32>,
     rule_xid_dict: HashMap<u32, u32>,
     rule_sub_label_dict: HashMap<u32, u32>,
+    suricata_classification: HashMap<String, String>,
 }
 
 impl EVELogParser {
@@ -377,7 +378,67 @@ impl EVELogParser {
             sub_label_map,
             rule_xid_dict: HashMap::new(),
             rule_sub_label_dict: HashMap::new(),
+            suricata_classification: HashMap::new(),
         }
+    }
+
+    pub fn rule_parse(&mut self, rule_dir: &str, rule_file_name_list: &[String]) {
+        let classification_config = format!("{}/classification.config", rule_dir);
+        let classification_pattern = Regex::new(r"config classification:\s+(.+),(.+),(\d+)").unwrap();
+
+        if let Ok(file) = File::open(&classification_config) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().flatten() {
+                let line = line.trim();
+                if let Some(caps) = classification_pattern.captures(line) {
+                    let key = caps.get(2).unwrap().as_str().trim().to_string();
+                    let value = caps.get(1).unwrap().as_str().trim().to_string();
+                    self.suricata_classification.insert(key, value);
+                }
+            }
+        } else {
+            error!("Failed to open classification config: {}", classification_config);
+        }
+
+        let rule_detail_pattern = Regex::new(r"\((.+)\)").unwrap();
+
+        for rule_file_name in rule_file_name_list {
+            let rule_path = format!("{}/{}", rule_dir, rule_file_name);
+            if let Ok(file) = File::open(&rule_path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten() {
+                    let line = line.trim();
+                    if let Some(caps) = rule_detail_pattern.captures(line) {
+                        let rule_detail = caps.get(1).unwrap().as_str();
+                        let entities: Vec<&str> = rule_detail.split(';').collect();
+                        
+                        let mut rule_dict = HashMap::new();
+                        for entity in entities {
+                            let parts: Vec<&str> = entity.split(':').collect();
+                            if parts.len() == 2 {
+                                rule_dict.insert(parts[0].trim(), parts[1].trim());
+                            }
+                        }
+
+                        if let (Some(sid_str), Some(classtype)) = (rule_dict.get("sid"), rule_dict.get("classtype")) {
+                            if let Ok(sid) = sid_str.parse::<u32>() {
+                                if let Some(xid) = self.xid_map.get(*classtype) {
+                                    self.rule_xid_dict.insert(sid, *xid);
+                                    if let Some(sub_label) = self.sub_label_map.get(xid) {
+                                        self.rule_sub_label_dict.insert(sid, *sub_label);
+                                    } else {
+                                        self.rule_sub_label_dict.insert(sid, 99);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                error!("Failed to open rule file: {}", rule_path);
+            }
+        }
+        info!("Rule parsing complete. Loaded {} rules.", self.rule_xid_dict.len());
     }
 
     pub fn parse_eve_log(&self, log_path: &str) -> Result<Vec<Value>> {
@@ -656,6 +717,8 @@ impl SuricataPcapProcessor {
             if version.get("return").and_then(|v| v.as_str()) == Some("OK") {
                 info!("Connected to Suricata: {:?}", version.get("message"));
             }
+
+            self.eve_parser.rule_parse(&self.config.rule_dir, &self.config.rule_file_name_list);
         }
 
         Ok(())
