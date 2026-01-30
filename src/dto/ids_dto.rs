@@ -1,4 +1,5 @@
 use chrono::{DateTime, Local, NaiveDateTime};
+use libc::uint32_t;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -68,8 +69,8 @@ pub struct PacketStat {
     pub app_proto: String,
     pub master_proto: String,
     pub l4_proto: String,
-    pub first_seen_ms: u64,
-    pub last_seen_ms: u64,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
     pub src_ip: String,
     pub src_port: u16,
     pub dst_ip: String,
@@ -175,6 +176,8 @@ pub struct PacketStat {
     pub dhcp_class_ident: String,
     pub plain_text: String,
     pub payload: String,
+    pub payload_interarrival_delay: String,
+    pub blacklist: Vec<String>,
 }
 
 impl PacketStat {
@@ -212,7 +215,14 @@ impl PacketStat {
         )
     }
 
-    pub fn add_packet(&mut self, received: bool, timestamp: i64, bytes: u64, goodput_bytes: u64, tcp_flag: Option<u8>) {
+    pub fn add_packet(
+        &mut self,
+        received: bool,
+        timestamp: i64,
+        bytes: u64,
+        goodput_bytes: u64,
+        tcp_flag: Option<u8>,
+    ) {
         self.last_seen_ms = timestamp;
         self.total_packets += 1;
         self.total_bytes += bytes;
@@ -331,7 +341,7 @@ impl PacketStat {
         };
 
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:.4}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:.4}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.mal,
             self.xid,
             self.sub_label,
@@ -434,12 +444,14 @@ impl PacketStat {
             self.dhcp_fingetprint,
             self.dhcp_class_ident,
             "",
-            ""
+            "",
+            self.payload_interarrival_delay,
+            self.blacklist .join(",")
         )
     }
 
     pub fn log_header() -> &'static str {
-        "mal|xcategory_id|category|appProto|masterProto|l4Proto|firstSeenMs|lastSeenMs|\
+        "mal|xCategoryId|category|appProto|masterProto|l4Proto|firstSeenMs|lastSeenMs|\
          srcIp:port|dstIp:port|totalPackets|totalBytes|\
          s2dPackets|s2dBytes|s2dGoodputBytes|\
          d2sPackets|d2sBytes|d2sGoodputBytes|\
@@ -462,6 +474,14 @@ impl PacketStat {
          hostServerName|info|miningCurrency|geolocation|dataRatio|stunMappedIp/port|stunPeerIp/port|\
          stunRelayedIp/port|stunResponseOriginIp/port|stunOtherIp/port|httpUrl|httpResponseStautsCode|\
          httpRequestContentType|contentType|natIp|server|userAgent|filename|bittorentHash|dhcpFingetprint|\
-         dhcpClassIdent|plainText|payload"
+         dhcpClassIdent|plainText|payload|payload_interarrival_delay|blacklist"
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PacketEvent {
+    pub len: u32,
+}
+
+unsafe impl aya::Pod for PacketEvent {}

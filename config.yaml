@@ -6,11 +6,13 @@ file:
   # pcap 파일 저장 기한 (기본 값: 7)
   pcap_period: 7
 
+blacklist_dir: /root/ids_rust/blacklist
+
 interface:
   # 패킷 수집 인터페이스 목록 (기본 값 : 모든 인터페이스)
-  target: ens18
+  target: ens19
   # 패킷 BPF 필터 문자열
-  filter: tcp
+  filter: port 80
 
 suricata:
   # Suricata에서 pcap을 읽은 로그를 저장할 경로

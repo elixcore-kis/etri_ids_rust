@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, TimeZone};
-use log::{debug, error, info};
-use pcap::{Capture, Linktype, Packet};
+use log::{debug, error, info, warn};
+use pcap::{Capture, Linktype, Packet, PacketHeader};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
@@ -11,14 +11,22 @@ use pnet::packet::Packet as PnetPacket;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+use aya::maps::perf::AsyncPerfEventArray;
+use aya::maps::{Array, HashMap as BpfHashMap, MapData};
+use aya::programs::{Xdp, XdpFlags};
+use aya::util::online_cpus;
+use aya::Ebpf;
+use bytes::BytesMut;
+use tokio::sync::mpsc;
+
+use crate::blacklist::blacklist::BlacklistManager;
 use crate::config::SuricataConfig;
-use crate::dto::{generate_packet_stat_id, PacketStat, PcapProcessingInfo};
+use crate::dto::{generate_packet_stat_id, PacketEvent, PacketStat, PcapProcessingInfo};
 use crate::service::suricata::SuricataPcapProcessor;
 
 pub struct PcapIDS {
@@ -29,6 +37,7 @@ pub struct PcapIDS {
     suricata_processor: Arc<Mutex<SuricataPcapProcessor>>,
     log_period: u32,
     pcap_period: u32,
+    blacklist_manager: Option<Arc<BlacklistManager>>,
 }
 
 impl PcapIDS {
@@ -41,6 +50,7 @@ impl PcapIDS {
         pcap_period: u32,
         suricata_config: SuricataConfig,
         _filter: Option<String>,
+        blacklist_manager: Option<Arc<BlacklistManager>>,
     ) -> Result<Self> {
         info!("분석 파일 저장 경로: {}", save_root_path);
 
@@ -68,6 +78,7 @@ impl PcapIDS {
             suricata_processor: Arc::new(Mutex::new(suricata_processor)),
             log_period,
             pcap_period,
+            blacklist_manager,
         })
     }
 
@@ -84,22 +95,10 @@ impl PcapIDS {
         Ok(ip_set)
     }
 
-    fn get_now_buffer_time(&self) -> i64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        self.get_buffer_time(now)
-    }
-
-    fn get_buffer_time(&self, timestamp_sec: i64) -> i64 {
-        timestamp_sec - (timestamp_sec % self.interval as i64)
-    }
-
     pub async fn start_capture(
         &mut self,
         target_interfaces: Option<String>,
-        filter: Option<String>,
+        _filter: Option<String>,
     ) -> Result<()> {
         let interfaces = if let Some(targets) = target_interfaces {
             targets
@@ -107,7 +106,8 @@ impl PcapIDS {
                 .map(|s: &str| s.trim().to_string())
                 .collect::<Vec<_>>()
         } else {
-            vec!["any".to_string()]
+            error!("XDP mode requires specific interfaces. 'any' is not supported.");
+            return Err(anyhow::anyhow!("Target interface required for XDP"));
         };
 
         let save_root = self.save_root_dir.clone();
@@ -116,24 +116,31 @@ impl PcapIDS {
         let log_period = self.log_period;
         let pcap_period = self.pcap_period;
         let suricata_ref = self.suricata_processor.clone();
+        let filter_opt = _filter.clone();
+        let blacklist_manager_ref = self.blacklist_manager.clone();
 
-        // 패킷 캡처 스레드 시작
+        // XDP 캡처 태스크 시작
         for iface in interfaces {
             let save_root_clone = save_root.clone();
-            let filter_clone = filter.clone();
             let my_ips_clone = my_ips.clone();
             let suricata_clone = suricata_ref.clone();
+            let iface_clone = iface.clone();
+            let filter_clone = filter_opt.clone();
+            let blacklist_manager_clone = blacklist_manager_ref.clone();
 
-            thread::spawn(move || {
-                if let Err(e) = Self::capture_and_save_loop(
-                    &iface,
-                    filter_clone,
+            tokio::spawn(async move {
+                if let Err(e) = Self::capture_and_save_loop_xdp(
+                    &iface_clone,
                     &save_root_clone,
                     interval_secs,
                     my_ips_clone,
                     suricata_clone,
-                ) {
-                    error!("Capture error on {}: {}", iface, e);
+                    filter_clone,
+                    blacklist_manager_clone,
+                )
+                .await
+                {
+                    error!("XDP Capture error on {}: {}", iface_clone, e);
                 }
             });
         }
@@ -144,7 +151,9 @@ impl PcapIDS {
             let mut interval = tokio::time::interval(Duration::from_secs(3600)); // 1시간마다
             loop {
                 interval.tick().await;
-                if let Err(e) = Self::file_organizer_static(&save_root_cleanup, log_period, pcap_period) {
+                if let Err(e) =
+                    Self::file_organizer_static(&save_root_cleanup, log_period, pcap_period)
+                {
                     error!("File organizer error: {}", e);
                 }
             }
@@ -153,30 +162,98 @@ impl PcapIDS {
         Ok(())
     }
 
-    fn capture_and_save_loop(
+    async fn capture_and_save_loop_xdp(
         interface: &str,
-        filter: Option<String>,
         save_root: &str,
         interval_secs: u64,
         my_ips: HashSet<String>,
         suricata: Arc<Mutex<SuricataPcapProcessor>>,
+        filter: Option<String>,
+        blacklist_manager: Option<Arc<BlacklistManager>>,
     ) -> Result<()> {
-        info!("Starting capture on interface: {}", interface);
+        info!("Starting XDP capture on interface: {}", interface);
 
-        let mut cap = Capture::from_device(interface)?
-            .promisc(true)
-            .snaplen(65535)
-            .timeout(1000)
-            .open()?;
-
-        if let Some(f) = &filter {
-            if !f.is_empty() {
-                cap.filter(f, true)?;
-                info!("Applied filter: {}", f);
+        let mut bpf_path = PathBuf::from("target/bpfel-unknown-none/debug/ids-xdp");
+        if !bpf_path.exists() {
+            bpf_path = PathBuf::from("target/bpfel-unknown-none/release/ids-xdp");
+            if !bpf_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "eBPF binary not found at {:?}. Please build it first with `cargo build --package ids-xdp`.",
+                    bpf_path
+                ));
             }
         }
+        info!("Loading eBPF from {:?}", bpf_path);
 
-        let linktype = cap.get_datalink();
+        let mut bpf = Ebpf::load_file(&bpf_path)?;
+        let program: &mut Xdp = bpf.program_mut("xdp_ids").unwrap().try_into()?;
+        program.load()?;
+        program
+            .attach(interface, XdpFlags::default())
+            .context(format!("Failed to attach XDP to {}", interface))?;
+
+        let mut perf_array = AsyncPerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
+
+        // (data, timestamp, original_len)
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, i64, u32)>(5000);
+
+        let cpus =
+            online_cpus().map_err(|e| anyhow::anyhow!("Failed to get online cpus: {:?}", e))?;
+        for cpu_id in cpus {
+            let mut buf = perf_array.open(cpu_id, None)?;
+            let tx = tx.clone();
+
+            tokio::spawn(async move {
+                // 패킷 최대 크기(65535) + 이벤트 구조체 크기 등을 고려하여 버퍼 크기 넉넉하게 잡음
+                let mut buffers = (0..10)
+                    .map(|_| BytesMut::with_capacity(65536 + 1024))
+                    .collect::<Vec<_>>();
+
+                loop {
+                    let events = buf.read_events(&mut buffers).await;
+                    match events {
+                        Ok(events) => {
+                            for i in 0..events.read {
+                                let buf = &buffers[i];
+
+                                // PacketEvent 구조체 읽기
+                                let event_size = std::mem::size_of::<PacketEvent>();
+                                if buf.len() < event_size {
+                                    continue;
+                                }
+
+                                let event = unsafe {
+                                    let ptr = buf.as_ptr() as *const PacketEvent;
+                                    *ptr
+                                };
+
+                                let packet_len = event.len as usize;
+
+                                // 실제 패킷 데이터는 구조체 바로 뒤에 위치
+                                if buf.len() < event_size + packet_len {
+                                    // 버퍼가 잘린 경우 (should not happen with sufficient buffer size)
+                                    continue;
+                                }
+
+                                let data = buf[event_size..event_size + packet_len].to_vec();
+
+                                let ts = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as i64;
+
+                                if tx.send((data, ts, event.len)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        let linktype = Linktype::ETHERNET;
 
         loop {
             let current_time = SystemTime::now()
@@ -188,14 +265,18 @@ impl PcapIDS {
 
             let temp_pcap_path = format!("{}/temp_pcap/{}.pcap", save_root, buffer_time);
 
-            info!("Creating pcap file for buffer time {}: {}", buffer_time, temp_pcap_path);
-
             // pcap 파일 생성
+            let cap = Capture::dead(linktype)?;
             let mut savefile = cap.savefile(&temp_pcap_path)?;
+
             let mut packet_stats: HashMap<String, PacketStat> = HashMap::new();
             let mut packet_count = 0u64;
 
-            // 현재 시간 슬롯 동안 패킷 캡처
+            info!(
+                "Creating pcap file for buffer time {}: {}",
+                buffer_time, temp_pcap_path
+            );
+
             loop {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -206,40 +287,55 @@ impl PcapIDS {
                     break;
                 }
 
-                match cap.next_packet() {
-                    Ok(packet) => {
-                        // pcap 파일에 저장
+                let remaining = next_buffer_time - now;
+                let timeout_duration =
+                    Duration::from_secs(if remaining > 0 { remaining as u64 } else { 1 });
+
+                match tokio::time::timeout(timeout_duration, rx.recv()).await {
+                    Ok(Some((data, ts, orig_len))) => {
+                        let header = PacketHeader {
+                            ts: libc::timeval {
+                                tv_sec: (ts / 1_000_000_000) as libc::time_t,
+                                tv_usec: ((ts % 1_000_000_000) / 1000) as libc::suseconds_t,
+                            },
+                            caplen: data.len() as u32,
+                            len: orig_len,
+                        };
+
+                        let packet = Packet {
+                            header: &header,
+                            data: &data,
+                        };
                         savefile.write(&packet);
+
                         packet_count += 1;
 
-                        // 패킷 통계 수집
-                        Self::process_packet_stats(&packet, &my_ips, &mut packet_stats, linktype);
+                        Self::process_packet_stats(&data, ts, &my_ips, &mut packet_stats);
                     }
-                    Err(pcap::Error::TimeoutExpired) => continue,
-                    Err(e) => {
-                        error!("Packet capture error: {}", e);
-                        thread::sleep(Duration::from_millis(100));
-                    }
+                    Ok(None) => return Ok(()),
+                    Err(_) => continue,
                 }
             }
 
-            // 파일 저장 완료
             drop(savefile);
+            info!(
+                "Buffer {} completed: {} packets captured",
+                buffer_time, packet_count
+            );
 
-            info!("Buffer {} completed: {} packets captured", buffer_time, packet_count);
-
-            // 별도 스레드에서 후처리 수행
             let save_root_clone = save_root.to_string();
             let suricata_clone = suricata.clone();
             let temp_path = temp_pcap_path.clone();
+            let blacklist_manager_clone = blacklist_manager.clone();
 
-            thread::spawn(move || {
+            tokio::spawn(async move {
                 if let Err(e) = Self::process_completed_buffer(
                     buffer_time,
                     &save_root_clone,
                     &temp_path,
                     packet_stats,
                     suricata_clone,
+                    blacklist_manager_clone,
                 ) {
                     error!("Buffer processing error: {}", e);
                 }
@@ -248,30 +344,18 @@ impl PcapIDS {
     }
 
     fn process_packet_stats(
-        packet: &Packet,
+        data: &[u8],
+        timestamp_ns: i64,
         my_ips: &HashSet<String>,
         stats: &mut HashMap<String, PacketStat>,
-        linktype: Linktype,
     ) {
-        let timestamp_ns = (packet.header.ts.tv_sec as i64 * 1_000_000_000)
-            + (packet.header.ts.tv_usec as i64 * 1000);
-
-        let data = packet.data;
-
-        // Ethernet 또는 raw IP 처리
-        let ip_data = if linktype == Linktype::ETHERNET {
-            if let Some(eth) = EthernetPacket::new(data) {
-                if eth.get_ethertype() == EtherTypes::Ipv4 {
-                    Some(eth.payload().to_vec())
-                } else {
-                    None
-                }
+        // Ethernet 패킷 파싱
+        let ip_data = if let Some(eth) = EthernetPacket::new(data) {
+            if eth.get_ethertype() == EtherTypes::Ipv4 {
+                Some(eth.payload().to_vec())
             } else {
                 None
             }
-        } else if linktype == Linktype(12) || linktype == Linktype(101) {
-            // Raw IP (Linux cooked capture 또는 raw)
-            Some(data.to_vec())
         } else {
             None
         };
@@ -357,8 +441,9 @@ impl PcapIDS {
         buffer_time: i64,
         save_root: &str,
         temp_pcap_path: &str,
-        packet_stats: HashMap<String, PacketStat>,
-        _suricata: Arc<Mutex<SuricataPcapProcessor>>,
+        mut packet_stats: HashMap<String, PacketStat>,
+        suricata: Arc<Mutex<SuricataPcapProcessor>>,
+        blacklist_manager: Option<Arc<BlacklistManager>>,
     ) -> Result<()> {
         let datetime = chrono::Local
             .timestamp_opt(buffer_time, 0)
@@ -377,6 +462,51 @@ impl PcapIDS {
         fs::create_dir_all(&save_log_dir)?;
         fs::create_dir_all(&save_pcap_dir)?;
 
+        // pcap 파일 이동
+        let new_pcap_path = format!("{}/{}.pcap", save_pcap_dir, save_file_name);
+        if Path::new(temp_pcap_path).exists() {
+            fs::rename(temp_pcap_path, &new_pcap_path)?;
+            info!("Saved pcap: {}", new_pcap_path);
+        } else {
+            warn!("Temp pcap file not found: {}", temp_pcap_path);
+        }
+
+        // Suricata 분석 수행
+        let pcap_absolute_path = fs::canonicalize(&new_pcap_path)
+            .unwrap_or_else(|_| PathBuf::from(&new_pcap_path))
+            .to_string_lossy()
+            .to_string();
+
+        let pcap_info = PcapProcessingInfo::new(
+            save_log_dir.clone(),
+            save_pcap_dir.clone(),
+            save_file_name.clone(),
+            pcap_absolute_path,
+            packet_stats.clone(),
+        );
+
+        match suricata.lock().unwrap().process_pcap(&pcap_info) {
+            Ok(records) => {
+                for record in records {
+                    Self::merge_suricata_record(&mut packet_stats, &record);
+                }
+                info!("Suricata analysis merged. Records: {}", packet_stats.len());
+            }
+            Err(e) => error!("Suricata processing failed: {}", e),
+        }
+
+        // 블랙리스트 검사
+        if let Some(bm) = blacklist_manager {
+            let blacklists = bm.get_blacklists();
+            for stat in packet_stats.values_mut() {
+                for (list_name, ip_set) in blacklists {
+                    if ip_set.contains(&stat.src_ip) || ip_set.contains(&stat.dst_ip) {
+                        stat.blacklist.push(list_name.clone());
+                    }
+                }
+            }
+        }
+
         // 로그 파일 저장
         let log_path = format!("{}/{}.log", save_log_dir, save_file_name);
         let mut log_file = File::create(&log_path)?;
@@ -388,14 +518,52 @@ impl PcapIDS {
 
         info!("Saved log: {} ({} flows)", log_path, packet_stats.len());
 
-        // pcap 파일 이동
-        let new_pcap_path = format!("{}/{}.pcap", save_pcap_dir, save_file_name);
-        if Path::new(temp_pcap_path).exists() {
-            fs::rename(temp_pcap_path, &new_pcap_path)?;
-            info!("Saved pcap: {}", new_pcap_path);
-        }
-
         Ok(())
+    }
+
+    fn merge_suricata_record(stats: &mut HashMap<String, PacketStat>, record: &serde_json::Value) {
+        let src_ip = record["srcIp"].as_str().unwrap_or_default();
+        let dst_ip = record["dstIp"].as_str().unwrap_or_default();
+        let src_port = record["srcPort"].as_u64().unwrap_or_default() as u16;
+        let dst_port = record["dstPort"].as_u64().unwrap_or_default() as u16;
+
+        let key1 = format!("{}:{}-{}:{}", src_ip, src_port, dst_ip, dst_port);
+        let key2 = format!("{}:{}-{}:{}", dst_ip, dst_port, src_ip, src_port);
+
+        let stat_opt: Option<&mut PacketStat> = if stats.contains_key(&key1) {
+            stats.get_mut(&key1)
+        } else if stats.contains_key(&key2) {
+            stats.get_mut(&key2)
+        } else {
+            None
+        };
+
+        if let Some(stat) = stat_opt {
+            if let Some(val) = record["appProto"].as_str() {
+                if stat.app_proto == "Unknown" && val != "failed" {
+                    stat.app_proto = val.to_string();
+                }
+            }
+
+            if let Some(val) = record["alertSubLabel"].as_u64() {
+                stat.sub_label = val as u32;
+            }
+
+            if let Some(val) = record["alertXid"].as_u64() {
+                stat.xid = val as u32;
+            }
+
+            if let Some(val) = record["eventType"].as_str(){
+                stat.suricata_event_type = val.to_string();
+            }
+
+            if let Some(val) = record["mal"].as_u64() {
+                stat.mal = val as u32;
+            }
+            if let Some(val) = record["flowId"].as_u64() {
+                stat.flow_id = val.to_string();
+            }
+        }
     }
 
     fn file_organizer_static(save_root: &str, log_period: u32, pcap_period: u32) -> Result<()> {
@@ -427,7 +595,8 @@ impl PcapIDS {
                 if let Some(name) = entry.file_name().to_str() {
                     if let Ok(value) = name.parse::<i32>() {
                         let path = entry.path();
-                        let depth = path.components().count() - Path::new(base_path).components().count();
+                        let depth =
+                            path.components().count() - Path::new(base_path).components().count();
 
                         let should_delete = match depth {
                             1 => value < cutoff.year(),

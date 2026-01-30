@@ -7,6 +7,8 @@ pub struct Config {
     pub file: FileConfig,
     pub interface: InterfaceConfig,
     pub suricata: SuricataConfig,
+    #[serde(default)]
+    pub blacklist_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

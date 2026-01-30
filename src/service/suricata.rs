@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, FixedOffset};
 use log::{debug, error, info, warn};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -336,6 +337,23 @@ impl EVELogParser {
         xid_map.insert("credential-theft".to_string(), 11);
         xid_map.insert("trojan-activity".to_string(), 16);
         xid_map.insert("pup-activity".to_string(), 16);
+        xid_map.insert("social-engineering".to_string(), 16);
+        xid_map.insert("rpc-portmap-decode".to_string(), 16);
+        xid_map.insert("unusual-client-port-connection".to_string(), 16);
+        xid_map.insert("non-standard-protocol".to_string(), 16);
+        xid_map.insert("web-application-activity".to_string(), 17);
+        xid_map.insert("web-application-attack".to_string(), 18);
+        xid_map.insert("protocol-command-decode".to_string(), 19);
+        xid_map.insert("shellcode-detect".to_string(), 19);
+        xid_map.insert("system-call-detect".to_string(), 19);
+        xid_map.insert("suspicious-filename-detect".to_string(), 20);
+        xid_map.insert("misc-activity".to_string(), 99);
+        xid_map.insert("bad-unknown".to_string(), 99);
+        xid_map.insert("policy-violation".to_string(), 99);
+        xid_map.insert("unknown".to_string(), 99);
+        xid_map.insert("misc-attack".to_string(), 99);
+        xid_map.insert("not-suspicious".to_string(), 99);
+        xid_map.insert("string-detect".to_string(), 99);
 
         let mut sub_label_map = HashMap::new();
         sub_label_map.insert(2, 1);
@@ -348,6 +366,11 @@ impl EVELogParser {
         sub_label_map.insert(10, 8);
         sub_label_map.insert(11, 9);
         sub_label_map.insert(16, 10);
+        sub_label_map.insert(17, 11);
+        sub_label_map.insert(18, 12);
+        sub_label_map.insert(19, 13);
+        sub_label_map.insert(20, 14);
+        sub_label_map.insert(99, 99);
 
         Self {
             xid_map,
@@ -386,28 +409,212 @@ impl EVELogParser {
         Ok(records)
     }
 
+    fn parse_tcp_flags(&self, flags_string: &str) -> HashMap<char, i32> {
+        let mut counts = HashMap::new();
+        for c in flags_string.chars() {
+            *counts.entry(c).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn convert_timestamp(&self, timestamp_str: &str) -> Option<i64> {
+        match DateTime::parse_from_rfc3339(timestamp_str) {
+            Ok(dt) => Some(dt.timestamp_nanos_opt().unwrap_or(0)),
+            Err(_) => None,
+        }
+    }
+
     fn process_eve_record(&self, data: &Value) -> Option<Value> {
         let event_type = data.get("event_type")?.as_str()?;
+
+        let mut record = json!({
+            "flowId": data.get("flow_id"),
+            "mal": 0,
+            "eventType": event_type,
+        });
 
         if !matches!(event_type, "flow" | "http" | "tls" | "ssh" | "quic" | "alert" | "anomaly") {
             return None;
         }
 
-        let mut record = json!({
-            "flowId": data.get("flow_id"),
-            "mal": 0,
-        });
+        let record_obj = record.as_object_mut().unwrap();
+        let flow = data.get("flow");
 
-        if let Some(_flow) = data.get("flow") {
-            if let Some(obj) = record.as_object_mut() {
-                obj.insert("appProto".to_string(), data.get("proto").unwrap_or(&json!("Unknown")).clone());
-                obj.insert("masterProto".to_string(), data.get("app_proto").unwrap_or(&json!("Unknown")).clone());
-                obj.insert("srcIp".to_string(), data.get("src_ip").unwrap_or(&json!("")).clone());
-                obj.insert("srcPort".to_string(), data.get("src_port").unwrap_or(&json!(0)).clone());
-                obj.insert("dstIp".to_string(), data.get("dest_ip").unwrap_or(&json!("")).clone());
-                obj.insert("dstPort".to_string(), data.get("dest_port").unwrap_or(&json!(0)).clone());
+        // 기본 정보 및 통계
+        if event_type == "flow" || flow.is_some() {
+            if let Some(flow_obj) = flow {
+                if let Some(start_str) = flow_obj.get("start").and_then(|v| v.as_str()) {
+                    if let Some(ts) = self.convert_timestamp(start_str) {
+                        record_obj.insert("firstSeenMs".to_string(), json!(ts));
+                    }
+                }
+                if let Some(end_str) = flow_obj.get("end").and_then(|v| v.as_str()) {
+                    if let Some(ts) = self.convert_timestamp(end_str) {
+                        record_obj.insert("lastSeenMs".to_string(), json!(ts));
+                    }
+                }
+
+                record_obj.insert("appProto".to_string(), data.get("proto").unwrap_or(&json!("Unknown")).clone());
+                record_obj.insert("masterProto".to_string(), data.get("app_proto").unwrap_or(&json!("Unknown")).clone());
+                record_obj.insert("l4Proto".to_string(), json!("Unknown")); // Python matches logic: fixed to Unknown
+                
+                let src_ip = data.get("src_ip").unwrap_or(&json!("")).as_str().unwrap_or("").to_string();
+                let src_port = data.get("src_port").unwrap_or(&json!(0)).to_string();
+                let dst_ip = data.get("dest_ip").unwrap_or(&json!("")).as_str().unwrap_or("").to_string();
+                let dst_port = data.get("dest_port").unwrap_or(&json!(0)).to_string();
+
+                record_obj.insert("srcIp".to_string(), json!(src_ip));
+                record_obj.insert("srcPort".to_string(), data.get("src_port").unwrap_or(&json!(0)).clone());
+                record_obj.insert("dstIp".to_string(), json!(dst_ip));
+                record_obj.insert("dstPort".to_string(), data.get("dest_port").unwrap_or(&json!(0)).clone());
+                
+                record_obj.insert("srcIp:port".to_string(), json!(format!("{}:{}", src_ip, src_port)));
+                record_obj.insert("dstIp:port".to_string(), json!(format!("{}:{}", dst_ip, dst_port)));
+
+                let s2d_pkts = flow_obj.get("pkts_toserver").and_then(|v| v.as_u64()).unwrap_or(0);
+                let d2s_pkts = flow_obj.get("pkts_toclient").and_then(|v| v.as_u64()).unwrap_or(0);
+                let s2d_bytes = flow_obj.get("bytes_toserver").and_then(|v| v.as_u64()).unwrap_or(0);
+                let d2s_bytes = flow_obj.get("bytes_toclient").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                record_obj.insert("totalPackets".to_string(), json!(s2d_pkts + d2s_pkts));
+                record_obj.insert("totalBytes".to_string(), json!(s2d_bytes + d2s_bytes));
+                record_obj.insert("s2dPackets".to_string(), json!(s2d_pkts));
+                record_obj.insert("s2dBytes".to_string(), json!(s2d_bytes));
+                record_obj.insert("d2sPackets".to_string(), json!(d2s_pkts));
+                record_obj.insert("d2sBytes".to_string(), json!(d2s_bytes));
+
+                if s2d_bytes > 0 && d2s_bytes > 0 {
+                    record_obj.insert("dataRatio".to_string(), json!((s2d_bytes as f64) / (d2s_bytes as f64)));
+                }
+
+                if data.get("proto").and_then(|v| v.as_str()) == Some("TCP") {
+                    let s2d_flags_str = flow_obj.get("tcp_flags_ts").and_then(|v| v.as_str()).unwrap_or("");
+                    let d2s_flags_str = flow_obj.get("tcp_flags_tc").and_then(|v| v.as_str()).unwrap_or("");
+                    
+                    let s2d_counts = self.parse_tcp_flags(s2d_flags_str);
+                    let d2s_counts = self.parse_tcp_flags(d2s_flags_str);
+
+                    let flags_map = [
+                        ('C', "cwr"), ('E', "ece"), ('U', "urg"), ('A', "ack"), 
+                        ('P', "psh"), ('R', "rst"), ('S', "syn"), ('F', "fin")
+                    ];
+
+                    for (char_code, name) in flags_map {
+                        let s2d_c = *s2d_counts.get(&char_code).unwrap_or(&0);
+                        let d2s_c = *d2s_counts.get(&char_code).unwrap_or(&0);
+                        let total_c = s2d_c + d2s_c;
+
+                        let mut name_cap = name.to_string(); // capitalize manually if needed, but python logic uses `name.capitalize()`
+                        // Python: cwr -> Cwr
+                        if let Some(first) = name_cap.get_mut(0..1) {
+                            first.make_ascii_uppercase();
+                        }
+
+                        record_obj.insert(format!("s2d{}Count", name_cap), json!(s2d_c));
+                        record_obj.insert(format!("d2s{}Count", name_cap), json!(d2s_c));
+                        record_obj.insert(format!("{}Count", name), json!(total_c));
+                    }
+                }
             }
         }
+
+        if event_type != "alert" && event_type != "anomaly" && event_type != "flow" {
+            record_obj.insert("eventType".to_string(), json!(event_type));
+        }
+
+        // 응용 계층 정보
+        let http = data.get("http");
+        if event_type == "http" || http.is_some() {
+            if let Some(http_obj) = http {
+                record_obj.insert("httpUrl".to_string(), http_obj.get("url").unwrap_or(&json!("")).clone());
+                record_obj.insert("hostServerName".to_string(), http_obj.get("hostname").unwrap_or(&json!("")).clone());
+                
+                let user_agent = http_obj.get("http_user_agent").and_then(|v| v.as_str()).unwrap_or("");
+                record_obj.insert("userAgent".to_string(), json!(user_agent));
+                
+                record_obj.insert("httpResponseStatusCode".to_string(), http_obj.get("status").unwrap_or(&json!("")).clone());
+                record_obj.insert("httpLength".to_string(), http_obj.get("length").unwrap_or(&json!("")).clone());
+
+                if !user_agent.is_empty() {
+                    let ua_lower = user_agent.to_lowercase();
+                    record_obj.insert("isSafari".to_string(), json!(ua_lower.contains("safari") && !ua_lower.contains("chrome")));
+                    record_obj.insert("isChrome".to_string(), json!(ua_lower.contains("chrome") && ua_lower.contains("safari"))); // Note: Chrome UA usually has both
+                    record_obj.insert("isFirefox".to_string(), json!(ua_lower.contains("firefox")));
+                }
+            }
+        }
+
+        let tls = data.get("tls");
+        if event_type == "tls" || tls.is_some() {
+            if let Some(tls_obj) = tls {
+                record_obj.insert("tls/sslServerNames".to_string(), tls_obj.get("sni").unwrap_or(&json!("")).clone());
+                record_obj.insert("subjectDn".to_string(), tls_obj.get("subject").unwrap_or(&json!("")).clone());
+                record_obj.insert("issuerDn".to_string(), tls_obj.get("issuerdn").unwrap_or(&json!("")).clone());
+                record_obj.insert("tls/sslVersion".to_string(), tls_obj.get("version").unwrap_or(&json!("")).clone());
+                record_obj.insert("certificateSha1".to_string(), tls_obj.get("fingerprint").unwrap_or(&json!("")).clone());
+                
+                if let Some(ja3) = data.get("ja3") {
+                    record_obj.insert("ja3ClientHash".to_string(), ja3.get("hash").unwrap_or(&json!("")).clone());
+                }
+                if let Some(ja3s) = data.get("ja3s") {
+                    record_obj.insert("ja3ServerHash".to_string(), ja3s.get("hash").unwrap_or(&json!("")).clone());
+                }
+                if let Some(ja4) = data.get("ja4") {
+                    record_obj.insert("ja4Client".to_string(), ja4.get("hash").unwrap_or(&json!("")).clone());
+                }
+            }
+        }
+
+        let ssh = data.get("ssh");
+        if event_type == "ssh" || ssh.is_some() {
+            if let Some(ssh_obj) = ssh {
+                if let Some(client) = ssh_obj.get("client") {
+                    record_obj.insert("clientHassh".to_string(), client.get("hassh").unwrap_or(&json!("")).clone());
+                }
+                if let Some(server) = ssh_obj.get("server") {
+                    record_obj.insert("serverHassh".to_string(), server.get("hassh").unwrap_or(&json!("")).clone());
+                }
+            }
+        }
+
+        if event_type == "quic" {
+            if let Some(quic) = data.get("quic") {
+                record_obj.insert("quicVersion".to_string(), quic.get("version").unwrap_or(&json!("")).clone());
+            }
+        }
+
+        let alert = data.get("alert");
+        if event_type == "alert" || alert.is_some() {
+            if let Some(alert_obj) = alert {
+                let sid = alert_obj.get("signature_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                
+                // Rust version note: rule_xid_dict is currently empty as rule parsing is not fully ported.
+                // Assuming defaults if not found.
+                let alert_xid = self.rule_xid_dict.get(&(sid as u32)).cloned().unwrap_or(99);
+                let alert_sub_label = self.rule_sub_label_dict.get(&(sid as u32)).cloned().unwrap_or(99);
+
+                record_obj.insert("alertId".to_string(), json!(sid));
+                record_obj.insert("alertSubLabel".to_string(), json!(alert_sub_label));
+                record_obj.insert("alertXid".to_string(), json!(alert_xid));
+                record_obj.insert("alertName".to_string(), alert_obj.get("signature").unwrap_or(&json!("")).clone());
+                record_obj.insert("alertCategory".to_string(), alert_obj.get("category").unwrap_or(&json!("")).clone());
+                record_obj.insert("mal".to_string(), json!(1));
+            }
+        }
+
+        let anomaly = data.get("anomaly");
+        if event_type == "anomaly" || anomaly.is_some() {
+            if let Some(anomaly_obj) = anomaly {
+                record_obj.insert("appProto".to_string(), anomaly_obj.get("app_proto").unwrap_or(&json!("")).clone());
+                record_obj.insert("anomalyType".to_string(), anomaly_obj.get("type").unwrap_or(&json!("")).clone());
+                record_obj.insert("anomalyEvent".to_string(), anomaly_obj.get("event").unwrap_or(&json!("")).clone());
+                record_obj.insert("anomalyLayer".to_string(), anomaly_obj.get("layer").unwrap_or(&json!("")).clone());
+            }
+        }
+
+        // 공통 사항
+        record_obj.insert("plainText".to_string(), data.get("payload_printable").unwrap_or(&json!("")).clone());
+        record_obj.insert("payload".to_string(), data.get("payload").unwrap_or(&json!("")).clone());
 
         Some(record)
     }
@@ -454,14 +661,14 @@ impl SuricataPcapProcessor {
         Ok(())
     }
 
-    pub fn process_pcap(&self, pcap_info: &PcapProcessingInfo) -> Result<()> {
+    pub fn process_pcap(&self, pcap_info: &PcapProcessingInfo) -> Result<Vec<Value>> {
         let current_log_dir = format!("{}/{}", self.config.log_dir, pcap_info.save_file_name);
         info!("Suricata Log Target Path: {}", current_log_dir);
         fs::create_dir_all(&current_log_dir)?;
 
         if pcap_info.packet_stats_dict.is_empty() {
             info!("No packets to process");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         self.cmd_executor.process_pcap(
@@ -473,7 +680,10 @@ impl SuricataPcapProcessor {
             manager.wait_pcap_complete(&pcap_info.read_pcap_file_absolute_path)?;
         }
 
-        Ok(())
+        let eve_log_path = format!("{}/eve.json", current_log_dir);
+        let records = self.eve_parser.parse_eve_log(&eve_log_path)?;
+        
+        Ok(records)
     }
 
     pub fn stop(&mut self) -> Result<()> {

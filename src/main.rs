@@ -1,14 +1,17 @@
 mod config;
 mod dto;
 mod service;
+mod blacklist;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info};
 use std::path::PathBuf;
 
+use std::sync::Arc;
 use config::Config;
 use service::ids::PcapIDS;
+use blacklist::blacklist::BlacklistManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "ids_rust")]
@@ -45,6 +48,17 @@ async fn main() -> Result<()> {
 
     info!("Configuration loaded from: {:?}", args.config_path);
 
+    let mut blacklist_manager: Option<Arc<BlacklistManager>> = None;
+    if let Some(blacklist_dir) = &config.blacklist_dir {
+        let mut bm = BlacklistManager::new();
+        if let Err(e) = bm.load_from_dir(blacklist_dir) {
+            error!("Failed to load blacklists: {}", e);
+        } else {
+            info!("Blacklist manager initialized.");
+            blacklist_manager = Some(Arc::new(bm));
+        }
+    }
+
     let target_interfaces = args
         .target_interfaces
         .or_else(|| config.interface.target.clone());
@@ -73,6 +87,7 @@ async fn main() -> Result<()> {
         config.file.pcap_period,
         config.suricata.clone(),
         filter.clone(),
+        blacklist_manager.clone(),
     )
     .context("Failed to initialize PcapIDS")?;
 
